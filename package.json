@@ -1,0 +1,14 @@
+{
+  "name": "munk-publish",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Public release artifacts and Cloudflare R2 sync for Munk AI",
+  "scripts": {
+    "sync:r2": "node scripts/sync-r2-and-prune.mjs",
+    "test": "node --test scripts/sync-r2-and-prune.test.mjs"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1096.0"
+  }
+}
