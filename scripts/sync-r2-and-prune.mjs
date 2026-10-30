@@ -6,8 +6,10 @@
  * - desktop/release/ (stable): ONLY macOS (darwin-arm64 & darwin-x64: .dmg, .zip, .blockmap, latest-mac.yml) + latest.json
  * - desktop/beta/: ALL 6 platforms (darwin-arm64/x64, win32-x64/arm64, linux-x64/arm64 + all latest*.yml) + latest.json
  */
-import { createReadStream, readdirSync, statSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { createReadStream, createWriteStream, mkdirSync, readdirSync, statSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
+import { pipeline } from "node:stream/promises";
 
 export const DESKTOP_LATEST_SCHEMA = "munk.desktop.latest.v1";
 
@@ -185,11 +187,146 @@ export function planPruneKeys(objectKeys, keepCount = 2) {
   };
 }
 
+async function listAllKeys(s3, ListObjectsV2Command, bucketName, prefix) {
+  const existingKeys = [];
+  let continuationToken = undefined;
+  do {
+    const page = await s3.send(
+      new ListObjectsV2Command({
+        Bucket: bucketName,
+        Prefix: prefix,
+        ContinuationToken: continuationToken,
+      }),
+    );
+    for (const obj of page.Contents ?? []) {
+      if (obj.Key) existingKeys.push(obj.Key);
+    }
+    continuationToken = page.IsTruncated ? page.NextContinuationToken : undefined;
+  } while (continuationToken);
+  return existingKeys;
+}
+
+async function pruneR2Channel({
+  s3,
+  ListObjectsV2Command,
+  DeleteObjectsCommand,
+  bucketName,
+  channel,
+  channelPrefix,
+  keepCount,
+}) {
+  const existingKeys = await listAllKeys(s3, ListObjectsV2Command, bucketName, channelPrefix);
+  const prunePlan = planPruneKeys(existingKeys, keepCount);
+  console.log(
+    `  [prune] channel=${channel} keeping versions=[${prunePlan.keptVersions.join(", ")}] pruning=[${prunePlan.prunedVersions.join(", ")}]`,
+  );
+  if (prunePlan.keysToDelete.length > 0) {
+    for (const k of prunePlan.keysToDelete) {
+      console.log(`    deleting ${basename(k)}`);
+    }
+    await s3.send(
+      new DeleteObjectsCommand({
+        Bucket: bucketName,
+        Delete: {
+          Objects: prunePlan.keysToDelete.map((Key) => ({ Key })),
+          Quiet: true,
+        },
+      }),
+    );
+  }
+}
+
+async function publishGithubFromR2AndPrune({
+  s3,
+  GetObjectCommand,
+  ListObjectsV2Command,
+  DeleteObjectsCommand,
+  bucketName,
+  prefix,
+  version,
+  tag,
+  assetsDir,
+  keepCount,
+}) {
+  const betaPrefix = prefix ? `${prefix}/desktop/beta/` : "desktop/beta/";
+  const allBetaKeys = await listAllKeys(s3, ListObjectsV2Command, bucketName, betaPrefix);
+  const matchingKeys = allBetaKeys.filter((k) => {
+    const name = basename(k);
+    if (!isDesktopReleaseAsset(name)) return false;
+    if (/^latest.*\.yml$/i.test(name)) return true;
+    return extractSemverFromKey(k) === version;
+  });
+
+  if (matchingKeys.length === 0) {
+    throw new Error(`No assets found on R2 under ${betaPrefix} for version=${version}`);
+  }
+
+  mkdirSync(assetsDir, { recursive: true });
+  const localFiles = [];
+  console.log(`\n=== Downloading ${matchingKeys.length} assets for ${tag} from R2 ===`);
+  for (const key of matchingKeys) {
+    const name = basename(key);
+    const localPath = join(assetsDir, name);
+    console.log(`  [download] ${key} -> ${localPath}`);
+    const res = await s3.send(new GetObjectCommand({ Bucket: bucketName, Key: key }));
+    await pipeline(res.Body, createWriteStream(localPath));
+    localFiles.push(localPath);
+  }
+
+  console.log(`\n=== Publishing GitHub Release ${tag} with ${localFiles.length} assets ===`);
+  let releaseExists = false;
+  try {
+    execFileSync("gh", ["release", "view", tag], { stdio: "ignore" });
+    releaseExists = true;
+  } catch {
+    releaseExists = false;
+  }
+
+  if (!releaseExists) {
+    execFileSync(
+      "gh",
+      [
+        "release",
+        "create",
+        tag,
+        "--title",
+        `Munk AI ${tag}`,
+        "--notes",
+        `Munk AI Desktop ${version} multi-platform release.`,
+        ...localFiles,
+      ],
+      { stdio: "inherit" },
+    );
+  } else {
+    execFileSync("gh", ["release", "upload", tag, "--clobber", ...localFiles], {
+      stdio: "inherit",
+    });
+    execFileSync("gh", ["release", "edit", tag, "--draft=false"], {
+      stdio: "inherit",
+    });
+  }
+
+  console.log(`\n=== Pruning old versions on R2 (keep=${keepCount}) ===`);
+  for (const channel of ["release", "beta"]) {
+    const channelPrefix = prefix ? `${prefix}/desktop/${channel}/` : `desktop/${channel}/`;
+    await pruneR2Channel({
+      s3,
+      ListObjectsV2Command,
+      DeleteObjectsCommand,
+      bucketName,
+      channel,
+      channelPrefix,
+      keepCount,
+    });
+  }
+}
+
 async function main() {
   const args = process.argv.slice(2);
   const dirArg = args.find((a) => a.startsWith("--dir="))?.slice("--dir=".length) || "./release-assets";
   const tagArg = args.find((a) => a.startsWith("--tag="))?.slice("--tag=".length) || process.env.RELEASE_TAG || "";
   const dryRun = args.includes("--dry-run");
+  const fromR2 = args.includes("--from-r2");
   const keepCount = Number(
     args.find((a) => a.startsWith("--keep="))?.slice("--keep=".length) || "2",
   );
@@ -198,18 +335,8 @@ async function main() {
   if (!version) {
     throw new Error("Missing --tag=<vX.Y.Z> or RELEASE_TAG env");
   }
-
+  const tag = `v${version}`;
   const assetsDir = resolve(process.cwd(), dirArg);
-  const allFiles = readdirSync(assetsDir)
-    .filter((f) => isDesktopReleaseAsset(f))
-    .sort();
-
-  if (allFiles.length === 0) {
-    throw new Error(`No desktop release assets found in ${assetsDir}`);
-  }
-
-  const releaseChannelFiles = allFiles.filter((f) => isMacArtifact(f));
-  const betaChannelFiles = allFiles;
 
   const accountId = process.env.R2_ACCOUNT_ID?.trim();
   const accessKeyId = process.env.R2_ACCESS_KEY_ID?.trim();
@@ -225,6 +352,7 @@ async function main() {
 
   const {
     S3Client,
+    GetObjectCommand,
     PutObjectCommand,
     ListObjectsV2Command,
     DeleteObjectsCommand,
@@ -238,6 +366,33 @@ async function main() {
         forcePathStyle: true,
       })
     : null;
+
+  if (fromR2) {
+    await publishGithubFromR2AndPrune({
+      s3,
+      GetObjectCommand,
+      ListObjectsV2Command,
+      DeleteObjectsCommand,
+      bucketName,
+      prefix,
+      version,
+      tag,
+      assetsDir,
+      keepCount,
+    });
+    return;
+  }
+
+  const allFiles = readdirSync(assetsDir)
+    .filter((f) => isDesktopReleaseAsset(f))
+    .sort();
+
+  if (allFiles.length === 0) {
+    throw new Error(`No desktop release assets found in ${assetsDir}`);
+  }
+
+  const releaseChannelFiles = allFiles.filter((f) => isMacArtifact(f));
+  const betaChannelFiles = allFiles;
 
   const channels = [
     { channel: "release", files: releaseChannelFiles },
@@ -291,43 +446,15 @@ async function main() {
           CacheControl: NO_CACHE,
         }),
       );
-    }
-
-    if (!dryRun && s3) {
-      const existingKeys = [];
-      let continuationToken = undefined;
-      do {
-        const page = await s3.send(
-          new ListObjectsV2Command({
-            Bucket: bucketName,
-            Prefix: channelPrefix,
-            ContinuationToken: continuationToken,
-          }),
-        );
-        for (const obj of page.Contents ?? []) {
-          if (obj.Key) existingKeys.push(obj.Key);
-        }
-        continuationToken = page.IsTruncated ? page.NextContinuationToken : undefined;
-      } while (continuationToken);
-
-      const prunePlan = planPruneKeys(existingKeys, keepCount);
-      console.log(
-        `  [prune] channel=${channel} keeping versions=[${prunePlan.keptVersions.join(", ")}] pruning=[${prunePlan.prunedVersions.join(", ")}]`,
-      );
-      if (prunePlan.keysToDelete.length > 0) {
-        for (const k of prunePlan.keysToDelete) {
-          console.log(`    deleting ${basename(k)}`);
-        }
-        await s3.send(
-          new DeleteObjectsCommand({
-            Bucket: bucketName,
-            Delete: {
-              Objects: prunePlan.keysToDelete.map((Key) => ({ Key })),
-              Quiet: true,
-            },
-          }),
-        );
-      }
+      await pruneR2Channel({
+        s3,
+        ListObjectsV2Command,
+        DeleteObjectsCommand,
+        bucketName,
+        channel,
+        channelPrefix,
+        keepCount,
+      });
     }
   }
 }

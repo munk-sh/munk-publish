@@ -1,17 +1,17 @@
-name: Release Smoke Test
+name: Smoke Test, Publish Release & Prune R2
 
 on:
-  release:
-    types: [published, edited]
+  repository_dispatch:
+    types: [r2_staged]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to smoke test (e.g. v2.0.0)"
+        description: "Release tag on R2 to smoke test & publish (e.g. v2.0.0)"
         required: true
         type: string
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   smoke:
@@ -25,27 +25,27 @@ jobs:
           - platform: darwin
             arch: arm64
             runner: macos-latest
-            pattern: "*-arm64.zip"
+            suffix: "-arm64.zip"
           - platform: darwin
             arch: x64
             runner: macos-26-intel
-            pattern: "*-x64.zip"
+            suffix: "-x64.zip"
           - platform: linux
             arch: x64
             runner: ubuntu-latest
-            pattern: "*-x86_64.AppImage"
+            suffix: "-x86_64.AppImage"
           - platform: linux
             arch: arm64
             runner: ubuntu-24.04-arm
-            pattern: "*-arm64.AppImage"
+            suffix: "-arm64.AppImage"
           - platform: win32
             arch: x64
             runner: windows-latest
-            pattern: "*-x64.exe"
+            suffix: "-x64.exe"
           - platform: win32
             arch: arm64
             runner: windows-11-arm
-            pattern: "*-arm64.exe"
+            suffix: "-arm64.exe"
 
     steps:
       - name: Checkout repository
@@ -56,22 +56,61 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Download target release asset
+      - name: Download target installer from Cloudflare R2
         shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
           INPUT_TAG: ${{ inputs.tag }}
-          EVENT_TAG: ${{ github.event.release.tag_name }}
-          PATTERN: ${{ matrix.pattern }}
+          DISPATCH_TAG: ${{ github.event.client_payload.tag }}
+          R2_PUBLIC_BASE_URL: ${{ secrets.R2_PUBLIC_BASE_URL }}
+          SUFFIX: ${{ matrix.suffix }}
         run: |
-          TAG="${INPUT_TAG:-$EVENT_TAG}"
+          TAG="${INPUT_TAG:-$DISPATCH_TAG}"
           if [ -z "$TAG" ]; then
             echo "No release tag specified"
             exit 1
           fi
+          VERSION="${TAG#v}"
+          BASE_URL="${R2_PUBLIC_BASE_URL:-https://downloads.munk.sh}"
+          BASE_URL="${BASE_URL%/}"
+          FILE_NAME="Munk AI-${VERSION}${SUFFIX}"
+          ENCODED_NAME="Munk%20AI-${VERSION}${SUFFIX}"
+          URL="${BASE_URL}/desktop/beta/${ENCODED_NAME}"
           mkdir -p ./release-assets
-          gh release download "$TAG" --dir ./release-assets --pattern "$PATTERN" --clobber
+          echo "Downloading ${URL} -> ./release-assets/${FILE_NAME}"
+          curl -fSL --retry 3 -o "./release-assets/${FILE_NAME}" "${URL}"
           ls -lh ./release-assets
 
       - name: Run packaged runtime smoke test
         run: node scripts/smoke-test-release.mjs --platform=${{ matrix.platform }} --arch=${{ matrix.arch }} --dir=./release-assets
+
+  publish-and-prune:
+    name: Publish GitHub Release & Prune R2
+    needs: smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Publish GitHub Release from R2 & prune old R2 versions (keep=2)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+          DISPATCH_TAG: ${{ github.event.client_payload.tag }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+          R2_PUBLIC_BASE_URL: ${{ secrets.R2_PUBLIC_BASE_URL }}
+          R2_REGION: ${{ secrets.R2_REGION }}
+        run: |
+          TAG="${INPUT_TAG:-$DISPATCH_TAG}"
+          node scripts/sync-r2-and-prune.mjs --from-r2 --tag="$TAG" --keep=2
