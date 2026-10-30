@@ -1,0 +1,77 @@
+name: Release Smoke Test
+
+on:
+  release:
+    types: [published, edited]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to smoke test (e.g. v2.0.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: smoke (${{ matrix.platform }}-${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: darwin
+            arch: arm64
+            runner: macos-latest
+            pattern: "*-arm64.zip"
+          - platform: darwin
+            arch: x64
+            runner: macos-26-intel
+            pattern: "*-x64.zip"
+          - platform: linux
+            arch: x64
+            runner: ubuntu-latest
+            pattern: "*-x86_64.AppImage"
+          - platform: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            pattern: "*-arm64.AppImage"
+          - platform: win32
+            arch: x64
+            runner: windows-latest
+            pattern: "*-x64.exe"
+          - platform: win32
+            arch: arm64
+            runner: windows-11-arm
+            pattern: "*-arm64.exe"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Download target release asset
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          PATTERN: ${{ matrix.pattern }}
+        run: |
+          TAG="${INPUT_TAG:-$EVENT_TAG}"
+          if [ -z "$TAG" ]; then
+            echo "No release tag specified"
+            exit 1
+          fi
+          mkdir -p ./release-assets
+          gh release download "$TAG" --dir ./release-assets --pattern "$PATTERN" --clobber
+          ls -lh ./release-assets
+
+      - name: Run packaged runtime smoke test
+        run: node scripts/smoke-test-release.mjs --platform=${{ matrix.platform }} --arch=${{ matrix.arch }} --dir=./release-assets
